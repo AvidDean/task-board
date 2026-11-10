@@ -1,0 +1,5 @@
+body { font-family: system-ui, sans-serif; background: #f4f6f8; margin: 0; }
+main { max-width: 480px; margin: 3rem auto; background: #fff; padding: 1.5rem; border-radius: 8px; }
+input { padding: .5rem; width: 70%; }
+button { padding: .5rem 1rem; }
+li { padding: .25rem 0; }
