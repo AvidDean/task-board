@@ -1,0 +1,8 @@
+services:
+  backend:
+    image: ${IMAGE\_BASE:-task-board}-backend:${IMAGE\_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-*}
+    ports:
+      - "${APP\_PORT:-80}:5000"
