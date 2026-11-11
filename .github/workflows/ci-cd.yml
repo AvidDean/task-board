@@ -1,0 +1,148 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ staging, main ]
+  pull_request:
+    branches: [ staging, main ]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test the backend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+
+      - name: Run pytest
+        run: pytest backend/test_app.py -v
+
+  build-and-scan:
+    name: Build and scan (backend)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set lower case repository name
+        run: |
+          echo "IMAGE_BASE=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set lower case repository name
+        run: |
+          echo "IMAGE_BASE=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ env.IMAGE_BASE }}-backend:${{ github.sha }}
+            ${{ env.IMAGE_BASE }}-backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy Application
+    needs: build-and-scan
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set Environment Targets
+        id: env-config
+        run: |
+          if [ "${{ github.ref_name }}" = "staging" ]; then
+            echo "TARGET_ENV=staging" >> $GITHUB_OUTPUT
+            echo "APP_DIR=/home/ubuntu/task-board-staging" >> $GITHUB_OUTPUT
+            echo "APP_PORT=8080" >> $GITHUB_OUTPUT
+            echo "API_URL=${{ vars.STAGING_API_URL }}" >> $GITHUB_OUTPUT
+            echo "FRONTEND_BUCKET=${{ vars.STAGING_FRONTEND_BUCKET }}" >> $GITHUB_OUTPUT
+            echo "FRONTEND_ORIGIN=${{ vars.STAGING_FRONTEND_ORIGIN }}" >> $GITHUB_OUTPUT
+          else
+            echo "TARGET_ENV=production" >> $GITHUB_OUTPUT
+            echo "APP_DIR=/home/ubuntu/task-board" >> $GITHUB_OUTPUT
+            echo "APP_PORT=80" >> $GITHUB_OUTPUT
+            echo "API_URL=${{ vars.PROD_API_URL }}" >> $GITHUB_OUTPUT
+            echo "FRONTEND_BUCKET=${{ vars.PROD_FRONTEND_BUCKET }}" >> $GITHUB_OUTPUT
+            echo "FRONTEND_ORIGIN=${{ vars.PROD_FRONTEND_ORIGIN }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Deploy Frontend to S3
+        run: |
+          echo "window.API_BASE = '${{ steps.env-config.outputs.API_URL }}';" > frontend/config.js
+          aws s3 sync frontend/ "s3://${{ steps.env-config.outputs.FRONTEND_BUCKET }}/" --delete
+
+      - name: Copy docker-compose.yml to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "docker-compose.yml"
+          target: "${{ steps.env-config.outputs.APP_DIR }}"
+
+      - name: Deploy Backend Containers on EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            TARGET_DIR="${{ steps.env-config.outputs.APP_DIR }}"
+            cd "$TARGET_DIR"
+
+            # Authenticate with GitHub Container Registry
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+            # Export dynamic environment variables with lowercase repository path
+            IMAGE_REPO="${{ github.repository }}"
+            export APP_PORT=${{ steps.env-config.outputs.APP_PORT }}
+            export FRONTEND_ORIGIN=${{ steps.env-config.outputs.FRONTEND_ORIGIN }}
+            export IMAGE_BASE="ghcr.io/${IMAGE_REPO,,}"
+            export IMAGE_TAG="${{ github.sha }}"
+
+            # Pull new image version and recreate container
+            docker pull "${IMAGE_BASE}-backend:${IMAGE_TAG}"
+            docker compose down || true
+            docker compose up -d --remove-orphans
